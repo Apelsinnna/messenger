@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<title>Мини-мессенджер (E2E)</title>
+<style>
+    body {
+        margin: 0; padding: 20px;
+        font-family: Arial, sans-serif;
+        background: #f5f5f5;
+    }
+    .container {
+        max-width: 600px; margin: auto;
+        background: white; padding: 20px;
+        border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    input, button {
+        width: 100%; padding: 10px;
+        margin: 5px 0; font-size: 16px;
+        border: 1px solid #ccc; border-radius: 6px;
+    }
+    #messages {
+        height: 360px; overflow-y: auto;
+        background: #eee; padding: 10px;
+        border-radius: 6px; margin-top: 10px;
+    }
+    .msg { margin-bottom: 10px; padding: 8px; background: #fff; border-radius: 6px; }
+    .time { font-size: 12px; color: #555; margin-top: 6px; }
+    .meta { font-size: 13px; color: #333; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Мини-чат (E2E)</h2>
+
+    <input id="chatKey" placeholder="Введите ключ чата (секрет)" />
+    <input id="username" placeholder="Ваш ник" />
+    <button id="joinBtn">Присоединиться</button>
+
+    <div id="messages"></div>
+
+    <input id="text" placeholder="Введите сообщение…" />
+    <button id="sendBtn">Отправить</button>
+</div>
+
+<script>
+const API_URL = "https://messenger.l4gutamax.workers.dev";
+
+let key = "";           
+let rawChatKey = "";    
+let username = "";
+let aesKey = null;
+
+// ======================
+//   Base64 helpers
+// ======================
+function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64) {
+    const binary = atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+}
+
+// ======================
+//   SHA-256 HASH
+// ======================
+async function hashChatKey(keyStr) {
+    const data = new TextEncoder().encode(keyStr);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    return [...new Uint8Array(hashBuffer)]
+        .map(b => b.toString(16).padStart(2, "0"))
+        .join("");
+}
+
+// ======================
+//   PBKDF2 → AES-GCM
+// ======================
+async function deriveAesKeyFromSecret(secret) {
+    const salt = new TextEncoder().encode("messenger-constant-salt-v1");
+    const secretBytes = new TextEncoder().encode(secret);
+
+    const baseKey = await crypto.subtle.importKey(
+        "raw",
+        secretBytes,
+        { name: "PBKDF2" },
+        false,
+        ["deriveKey"]
+    );
+
+    return crypto.subtle.deriveKey(
+        {
+            name: "PBKDF2",
+            salt: salt,
+            iterations: 100000,
+            hash: "SHA-256"
+        },
+        baseKey,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["encrypt", "decrypt"]
+    );
+}
+
+// ======================
+//   Encrypt
+// ======================
+async function encryptText(plainText) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encoded = new TextEncoder().encode(plainText);
+
+    const cipherBuffer = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv },
+        aesKey,
+        encoded
+    );
+
+    return {
+        cipher: arrayBufferToBase64(cipherBuffer),
+        iv: arrayBufferToBase64(iv)
+    };
+}
+
+// ======================
+//   Decrypt
+// ======================
+async function decryptText(cipherB64, ivB64) {
+    try {
+        const cipher = base64ToArrayBuffer(cipherB64);
+        const iv = new Uint8Array(base64ToArrayBuffer(ivB64));
+
+        const plainBuffer = await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv },
+            aesKey,
+            cipher
+        );
+
+        return new TextDecoder().decode(plainBuffer);
+    } catch (e) {
+        return "[ошибка расшифровки]";
+    }
+}
+
+// ======================
+//  РЕНДЕР СООБЩЕНИЙ
+// ======================
+function renderMessages(messages) {
+    const box = document.getElementById("messages");
+    box.innerHTML = "";
+
+    for (const m of messages) {
+        let plain = "";
+
+        if (m.cipher && m.iv) {
+            plain = "Дешифрую...";
+        } else if (m.text) {
+            plain = m.text;
+        } else {
+            plain = "[некорректное сообщение]";
+        }
+
+        const ts = m.time ?? m.ts ?? Date.now();
+        const timeStr = new Date(ts).toLocaleString();
+
+        box.innerHTML += `
+            <div class="msg">
+                <div class="meta"><b>${escapeHtml(m.name || "??")}</b></div>
+                <div class="msgtext" data-cipher="${m.cipher || ""}" data-iv="${m.iv || ""}">
+                    ${escapeHtml(plain)}
+                </div>
+                <div class="time">${timeStr}</div>
+            </div>
+        `;
+    }
+
+    box.scrollTop = box.scrollHeight;
+}
+
+// После отрисовки — отдельно дешифруем (SERIAL)
+async function decryptRendered() {
+    const items = document.querySelectorAll(".msgtext");
+
+    for (const div of items) {
+        const cipher = div.dataset.cipher;
+        const iv = div.dataset.iv;
+        if (!cipher || !iv) continue;
+
+        const plain = await decryptText(cipher, iv);
+        div.innerText = plain;
+    }
+}
+
+// ======================
+//    LONG POLLING
+// ======================
+async function startLongPolling() {
+    if (!key) return;
+
+    while (true) {
+        try {
+            const messagesNow = document.querySelectorAll(".msgtext").length;
+
+            const resp = await fetch(
+                `${API_URL}/read?key=${encodeURIComponent(key)}&count=${messagesNow}`
+            );
+
+            if (!resp.ok) {
+                console.warn("Server error:", resp.status, resp.statusText);
+                await new Promise(r => setTimeout(r, 2000));
+                continue;
+            }
+
+            const data = await resp.json();
+
+            // обновились сообщения
+            if (data.messages) {
+                renderMessages(data.messages);
+                await decryptRendered();
+            }
+
+            // если data.nochange === true — ничего не делаем
+
+        } catch (e) {
+            console.error("long polling error:", e);
+        }
+
+        // важное: long polling НЕ делает паузу
+        // следующий запрос отправится сразу
+    }
+}
+
+// ======================
+//   JOIN
+// ======================
+document.getElementById("joinBtn").onclick = async () => {
+    rawChatKey = document.getElementById("chatKey").value.trim();
+    username = document.getElementById("username").value.trim();
+
+    if (!rawChatKey || !username) {
+        alert("Введите ключ и имя!");
+        return;
+    }
+
+    key = await hashChatKey(rawChatKey);
+    aesKey = await deriveAesKeyFromSecret(rawChatKey);
+
+    // очищаем чат при входе
+    document.getElementById("messages").innerHTML = "";
+
+    // запускаем long polling
+    startLongPolling();
+};
+
+// ======================
+//   SEND MESSAGE
+// ======================
+document.getElementById("sendBtn").onclick = async () => {
+    const text = document.getElementById("text").value.trim();
+    if (!text) return;
+
+    const encrypted = await encryptText(text);
+
+    const payload = {
+        key,
+        name: username,
+        cipher: encrypted.cipher,
+        iv: encrypted.iv,
+        time: Date.now()
+    };
+
+    await fetch(`${API_URL}/send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+    });
+
+    document.getElementById("text").value = "";
+};
+
+// ======================
+//   XSS PROTECT
+// ======================
+function escapeHtml(str) {
+    return String(str)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+</script>
+</body>
+</html>
