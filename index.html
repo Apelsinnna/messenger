@@ -207,6 +207,7 @@ async function startLongPolling() {
     if (!key) return;
 
     while (true) {
+    console.log("делаем запрос на сервер")
         try {
             const messagesNow = document.querySelectorAll(".msgtext").length;
 
@@ -221,7 +222,7 @@ async function startLongPolling() {
             }
 
             const data = await resp.json();
-
+            console.log(data)
             // обновились сообщения
             if (data.messages) {
                 renderMessages(data.messages);
@@ -262,30 +263,61 @@ document.getElementById("joinBtn").onclick = async () => {
 };
 
 // ======================
-//   SEND MESSAGE
+//   SEND MESSAGE (with status)
 // ======================
 document.getElementById("sendBtn").onclick = async () => {
-    const text = document.getElementById("text").value.trim();
+    const btn = document.getElementById("sendBtn");
+    const input = document.getElementById("text");
+
+    const text = input.value.trim();
     if (!text) return;
 
-    const encrypted = await encryptText(text);
+    // Блокируем кнопку и меняем текст
+    btn.disabled = true;
+    const oldText = btn.textContent;
+    btn.textContent = "Отправка...";
 
-    const payload = {
-        key,
-        name: username,
-        cipher: encrypted.cipher,
-        iv: encrypted.iv,
-        time: Date.now()
-    };
+    try {
+        const encrypted = await encryptText(text);
 
-    await fetch(`${API_URL}/send`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-    });
+        const payload = {
+            key,
+            name: username,
+            cipher: encrypted.cipher,
+            iv: encrypted.iv,
+            time: Date.now()
+        };
 
-    document.getElementById("text").value = "";
+        const resp = await fetch(`${API_URL}/send`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+            throw new Error(`Server error ${resp.status}`);
+        }
+
+        const data = await resp.json();
+        console.log(data)
+
+        if (!data.ok) {
+            throw new Error("Message not saved");
+        }
+
+        // Успех
+        input.value = "";
+
+    } catch (err) {
+        console.error("Send failed:", err);
+        alert("Не удалось отправить сообщение");
+    } finally {
+        // Возвращаем кнопку в нормальное состояние
+        btn.disabled = false;
+        btn.textContent = oldText;
+    }
 };
+
 
 // ======================
 //   XSS PROTECT
